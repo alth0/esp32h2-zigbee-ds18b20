@@ -1,0 +1,14 @@
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+.pytest_cache/
+__pycache__/
+*.pyc
+
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
