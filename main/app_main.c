@@ -14,8 +14,9 @@
 #define SENSOR_1_ENDPOINT      1
 #define SENSOR_2_ENDPOINT      2
 #define DS_GPIO                4
-#define MEASURE_INTERVAL_MS    (5 * 60 * 1000)
-#define TEMP_DELTA             50
+#define MEASURE_INTERVAL_MS    (5 * 60 * 1000)  // 5 minutes
+#define MAX_REPORT_INTERVAL_MS (30 * 60 * 1000) // 30 minutes heartbeat
+#define TEMP_DELTA             50               // 0.5°C change trigger
 
 // ---------- GLOBAL VARIABLES ----------
 static int16_t sensor1_temp_value = 0;
@@ -70,17 +71,11 @@ static void ds18b20_init_sensors(void) {
     ESP_LOGI(TAG, "Bus initialization complete.");
 }
 
-static float ds18b20_read_individual(ds18b20_device_handle_t sensor) {
-    float temp = 0;
-    if (!sensor) return -127.0;
-    if (ds18b20_trigger_temperature_conversion(sensor) != ESP_OK) return -127.0;
-    vTaskDelay(pdMS_TO_TICKS(750)); // Conversion wait time
-    if (ds18b20_get_temperature(sensor, &temp) != ESP_OK) return -127.0;
-    return temp;
-}
-
 // ---------- ZIGBEE REPORTING ----------
 static void report_temperature(uint8_t endpoint, int16_t value) {
+    // CRITICAL: Prevent multi-threaded memory corruptions on the stack thread
+    esp_zb_lock_acquire(portMAX_DELAY);
+
     esp_zb_zcl_set_attribute_val(
         endpoint,
         ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
@@ -100,33 +95,67 @@ static void report_temperature(uint8_t endpoint, int16_t value) {
     };
 
     esp_zb_zcl_report_attr_cmd_req(&report_req);
+    
+    esp_zb_lock_release();
     ESP_LOGI(TAG, "ZCL Report Sent from Endpoint %d: %d", endpoint, value);
 }
 
 // ---------- SENSOR TASK ----------
 static void sensor_task(void *pvParameters) {
+    uint32_t s1_last_report_time = 0;
+    uint32_t s2_last_report_time = 0;
+
     while (1) {
+        if (!ds18b20_s1 && !ds18b20_s2) {
+            ESP_LOGE(TAG, "No sensors initialized. Suspending loop iteration.");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+
+        // Parallel trigger execution: Tell both devices to calculate conversions concurrently
+        if (ds18b20_s1) ds18b20_trigger_temperature_conversion(ds18b20_s1);
+        if (ds18b20_s2) ds18b20_trigger_temperature_conversion(ds18b20_s2);
+
+        // A single 750ms sleep window serves both sensors simultaneously
+        vTaskDelay(pdMS_TO_TICKS(750)); 
+
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
         // --- Process Sensor 1 ---
         if (ds18b20_s1) {
-            float temp1 = ds18b20_read_individual(ds18b20_s1);
-            if (temp1 > -100) {
+            float temp1 = 0;
+            if (ds18b20_get_temperature(ds18b20_s1, &temp1) == ESP_OK && temp1 > -100) {
                 sensor1_temp_value = (int16_t)(temp1 * 100);
-                if (abs(sensor1_temp_value - sensor1_last_reported) >= TEMP_DELTA) {
+                
+                if ((abs(sensor1_temp_value - sensor1_last_reported) >= TEMP_DELTA) ||
+                    (current_time - s1_last_report_time >= MAX_REPORT_INTERVAL_MS) ||
+                    (sensor1_last_reported == -10000)) {
+                    
                     report_temperature(SENSOR_1_ENDPOINT, sensor1_temp_value);
                     sensor1_last_reported = sensor1_temp_value;
+                    s1_last_report_time = current_time;
                 }
+            } else {
+                ESP_LOGW(TAG, "Failed reading sensor 1.");
             }
         }
 
         // --- Process Sensor 2 ---
         if (ds18b20_s2) {
-            float temp2 = ds18b20_read_individual(ds18b20_s2);
-            if (temp2 > -100) {
+            float temp2 = 0;
+            if (ds18b20_get_temperature(ds18b20_s2, &temp2) == ESP_OK && temp2 > -100) {
                 sensor2_temp_value = (int16_t)(temp2 * 100);
-                if (abs(sensor2_temp_value - sensor2_last_reported) >= TEMP_DELTA) {
+                
+                if ((abs(sensor2_temp_value - sensor2_last_reported) >= TEMP_DELTA) ||
+                    (current_time - s2_last_report_time >= MAX_REPORT_INTERVAL_MS) ||
+                    (sensor2_last_reported == -10000)) {
+                    
                     report_temperature(SENSOR_2_ENDPOINT, sensor2_temp_value);
                     sensor2_last_reported = sensor2_temp_value;
+                    s2_last_report_time = current_time;
                 }
+            } else {
+                ESP_LOGW(TAG, "Failed reading sensor 2.");
             }
         }
 
@@ -141,17 +170,25 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
 
     switch (sig_type) {
     case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
+        ESP_LOGI(TAG, "Zigbee stack initialized. Starting Network Steering...");
+        esp_zb_lock_acquire(portMAX_DELAY);
         esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+        esp_zb_lock_release();
         break;
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Joined network successfully");
         } else {
-            ESP_LOGW(TAG, "Join failed, status: %d", err_status);
+            ESP_LOGW(TAG, "Join failed, status: %i. Retrying steering in 10s...", err_status);
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            esp_zb_lock_acquire(portMAX_DELAY);
+            esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            esp_zb_lock_release();
         }
         break;
     default:
+        ESP_LOGD(TAG, "Unhandled Zigbee signal: 0x%x", sig_type);
         break;
     }
 }
@@ -195,7 +232,6 @@ static void zigbee_init(void) {
     esp_zb_ep_list_add_ep(ep_list, cluster_list1, ep_cfg1);
 
     // ================== ENDPOINT 2 (Sensor 2) ==================
-    // Note: Zigbee requires endpoints to have separate cluster instances
     esp_zb_temperature_meas_cluster_cfg_t temp_cfg2 = { .measured_value = 0, .min_value = -5000, .max_value = 10000 };
     esp_zb_attribute_list_t *temp_attr_list2 = esp_zb_temperature_meas_cluster_create(&temp_cfg2);
 
