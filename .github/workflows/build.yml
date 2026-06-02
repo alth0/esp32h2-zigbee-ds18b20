@@ -18,36 +18,23 @@ jobs:
         with:
           submodules: 'recursive'
 
-      - name: Build Firmware with ESP-IDF
+      - name: Build Firmware and Merge Binaries
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: 'v5.3'
           target: 'esp32h2'
           path: '.'
-          command: 'idf.py build'
-
-      - name: Prepare Release Artifacts (Merge and Checksum)
-        run: |
-          mkdir -p release_assets
-          TAG_NAME="${{ github.ref_name }}"
-          BRANCH_NAME="${{ github.base_ref || github.ref }}"
-          
-          if [[ "$BRANCH_NAME" == *"dual"* ]]; then
-            CONFIG_TYPE="dual-sensor"
-          else
-            CONFIG_TYPE="single-sensor"
-          fi
-          
-          python $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32h2 merge_bin \
-            -o "release_assets/esp32h2-zigbee-${CONFIG_TYPE}-factory-${TAG_NAME}.bin" \
-            @build/flash_args
-          
-          CORE_BIN=$(find build/ -maxdepth 1 -name "*.bin" | head -n 1)
-          cp "$CORE_BIN" "release_assets/esp32h2-zigbee-${CONFIG_TYPE}-standalone-${TAG_NAME}.bin"
-          
-          cd release_assets
-          sha256sum *.bin > checksums.txt
-          cd ..
+          command: |
+            idf.py build && 
+            mkdir -p release_assets && 
+            TAG_NAME="${{ github.ref_name }}" && 
+            BRANCH_NAME="${{ github.base_ref || github.ref }}" && 
+            if [[ "$BRANCH_NAME" == *"dual"* ]]; then CONFIG_TYPE="dual-sensor"; else CONFIG_TYPE="single-sensor"; fi && 
+            esptool.py --chip esp32h2 merge_bin -o "release_assets/esp32h2-zigbee-${CONFIG_TYPE}-factory-${TAG_NAME}.bin" @build/flash_args && 
+            CORE_BIN=$(find build/ -maxdepth 1 -name "*.bin" | head -n 1) && 
+            cp "$CORE_BIN" "release_assets/esp32h2-zigbee-${CONFIG_TYPE}-standalone-${TAG_NAME}.bin" && 
+            cd release_assets && 
+            sha256sum *.bin > checksums.txt
 
       - name: Create Release and Upload Binaries
         uses: softprops/action-gh-release@v2
