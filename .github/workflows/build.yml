@@ -47,6 +47,6 @@ jobs:
             release_assets/esp32h2-zigbee-*-standalone-*.bin
             release_assets/checksums.txt
           name: Release ${{ github.ref_name }}
-          tag_name: ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}
           draft: false
           prerelease: false
