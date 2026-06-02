@@ -29,7 +29,7 @@ jobs:
             mkdir -p release_assets && 
             TAG_NAME="${{ github.ref_name }}" && 
             BRANCH_NAME="${{ github.base_ref || github.ref }}" && 
-            if [[ "$BRANCH_NAME" == *"dual"* ]]; then CONFIG_TYPE="dual-sensor"; else CONFIG_TYPE="single-sensor"; fi && 
+            if [[ "$BRANCH_NAME" == *"dual-sensor"* ]]; then CONFIG_TYPE="dual-sensor"; else CONFIG_TYPE="single-sensor"; fi && 
             cd build && 
             esptool.py --chip esp32h2 merge_bin -o "esp32h2-zigbee-${CONFIG_TYPE}-factory-${TAG_NAME}.bin" @flash_args && 
             cd .. && 
