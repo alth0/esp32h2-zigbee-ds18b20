@@ -38,7 +38,7 @@ jobs:
             CONFIG_TYPE="single-sensor"
           fi
           
-          esptool.py --chip esp32h2 merge_bin \
+          python $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32h2 merge_bin \
             -o "release_assets/esp32h2-zigbee-${CONFIG_TYPE}-factory-${TAG_NAME}.bin" \
             @build/flash_args
           
