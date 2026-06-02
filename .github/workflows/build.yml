@@ -1,0 +1,62 @@
+name: Automated Firmware Compiler
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Build Firmware with ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: 'v5.3'
+          target: 'esp32h2'
+          path: '.'
+          command: 'idf.py build'
+
+      - name: Prepare Release Artifacts (Merge and Checksum)
+        run: |
+          mkdir -p release_assets
+          TAG_NAME="${{ github.ref_name }}"
+          BRANCH_NAME="${{ github.base_ref || github.ref }}"
+          
+          if [[ "$BRANCH_NAME" == *"dual"* ]]; then
+            CONFIG_TYPE="dual-sensor"
+          else
+            CONFIG_TYPE="single-sensor"
+          fi
+          
+          esptool.py --chip esp32h2 merge_bin \
+            -o "release_assets/esp32h2-zigbee-${CONFIG_TYPE}-factory-${TAG_NAME}.bin" \
+            @build/flash_args
+          
+          CORE_BIN=$(find build/ -maxdepth 1 -name "*.bin" | head -n 1)
+          cp "$CORE_BIN" "release_assets/esp32h2-zigbee-${CONFIG_TYPE}-standalone-${TAG_NAME}.bin"
+          
+          cd release_assets
+          sha256sum *.bin > checksums.txt
+          cd ..
+
+      - name: Create Release and Upload Binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release_assets/esp32h2-zigbee-*-factory-*.bin
+            release_assets/esp32h2-zigbee-*-standalone-*.bin
+            release_assets/checksums.txt
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref }}
+          draft: false
+          prerelease: false
