@@ -2,7 +2,7 @@
 
 This project configures an ESP32-H2 into a battery-friendly Zigbee End Device that monitors ambient conditions using a DS18B20 temperature sensor. By default, the firmware automatically initializes the 1-Wire protocol on GPIO 4 using the ESP-IDF RMT peripheral backend. The device unconditionally transmits a Zigbee cluster report every 5 minutes.
 
-For ultra-low power optimization, the system implements automated power-source detection using a hardware resistor voltage divider connected to GPIO 5. When 5V USB power is disconnected, the system utilizes deep sleep instead of vTaskDelay between Zigbee transmission intervals and also inhibits any LED activity.
+For ultra-low power optimization, the system implements automated power-source detection using a hardware resistor voltage divider connected to GPIO 5. When 5V USB power is disconnected, the system utilizes deep sleep instead of `vTaskDelay` between Zigbee transmission intervals and also inhibits any LED activity.
 
 To flash the firmware, download the combined factory binary from the [Releases](https://github.com/alth0/esp32h2-zigbee-ds18b20/releases) tab. Connect your ESP32-H2 to your computer, hold the BOOT button while resetting the board to enter download mode, and run the following command using `esptool.py`:
 
