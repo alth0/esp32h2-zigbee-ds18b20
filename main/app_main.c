@@ -8,15 +8,18 @@
 #include "onewire_bus.h"
 #include "ds18b20.h"
 #include "led_strip.h"
+#include "driver/gpio.h"    // Required for power detection GPIO handling
+#include "esp_sleep.h"      // Required for Hardware Deep Sleep APIs
 
 #define TAG "ZB_TEMP"
 
 // ---------- CONFIGURATION ----------
 #define SENSOR_1_ENDPOINT      1
 #define DS_GPIO                4
+#define VBUS_DET_GPIO          5   // Voltage divider input pin for 5V tracking
 
 // Calibration Offset in Degrees Celsius
-#define SENSOR_OFFSET         0.0  
+#define SENSOR_OFFSET          0.0  
 
 // Super Mini On-Board WS2812B Pin Configuration
 #define NEOPIXEL_GPIO          8   
@@ -25,8 +28,15 @@
 // Transmission interval set strictly to 5 minutes
 #define TRANSMIT_INTERVAL_MS   (5 * 60 * 1000)  
 
+// Deep sleep calculation macro (5 Minutes)
+#define US_PER_MIN             60000000
+#define SLEEP_DURATION_US      (5 * US_PER_MIN)
+
 // ---------- GLOBAL VARIABLES ----------
 static int16_t sensor1_temp_value = 0;
+
+// Track cold boots vs deep sleep resets inside low-power RTC slow memory
+RTC_DATA_ATTR static uint32_t total_boot_cycles = 0;
 
 static onewire_bus_handle_t bus = NULL;
 static ds18b20_device_handle_t ds18b20_s1 = NULL;
@@ -35,6 +45,19 @@ static ds18b20_device_handle_t ds18b20_s1 = NULL;
 static led_strip_handle_t led_strip;
 static bool zigbee_connected = false;
 static TaskHandle_t red_led_task_handle = NULL;
+static TaskHandle_t power_monitor_task_handle = NULL;
+
+// ---------- VOLTAGE DETECTION INITIALIZATION ----------
+static void init_power_detection(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << VBUS_DET_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE, // Ensures 0V reading when USB is unplugged
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+}
 
 // ---------- WS2812B NEOPIXEL LOGIC ----------
 static void init_neopixel(void) {
@@ -77,7 +100,7 @@ static void neopixel_startup_test_cycle(void) {
     led_strip_clear(led_strip);
 }
 
-// Background task that pulses Red when disconnected
+// Background task that pulses Red when disconnected (Only runs on USB)
 static void red_led_blink_task(void *pvParameters) {
     while (1) {
         if (!zigbee_connected) {
@@ -96,31 +119,79 @@ static void red_led_blink_task(void *pvParameters) {
 
 static void update_connection_leds(bool connected) {
     zigbee_connected = connected;
-    if (connected) {
-        if (red_led_task_handle) {
-            vTaskSuspend(red_led_task_handle);
-        }
-        led_strip_set_pixel(led_strip, 0, 0, 48, 0);
-        led_strip_refresh(led_strip);
-    } else {
-        if (red_led_task_handle) {
-            vTaskResume(red_led_task_handle); 
+    
+    if (gpio_get_level(VBUS_DET_GPIO) == 1) {
+        if (connected) {
+            if (red_led_task_handle) {
+                vTaskSuspend(red_led_task_handle);
+            }
+            led_strip_set_pixel(led_strip, 0, 0, 48, 0);
+            led_strip_refresh(led_strip);
+        } else {
+            if (red_led_task_handle) {
+                vTaskResume(red_led_task_handle); 
+            }
         }
     }
 }
 
 static void flash_blue_led(void) {
-    led_strip_set_pixel(led_strip, 0, 0, 0, 128);
-    led_strip_refresh(led_strip);
-    
-    vTaskDelay(pdMS_TO_TICKS(150)); 
+    if (gpio_get_level(VBUS_DET_GPIO) == 1) {
+        led_strip_set_pixel(led_strip, 0, 0, 0, 128);
+        led_strip_refresh(led_strip);
+        
+        vTaskDelay(pdMS_TO_TICKS(150)); 
 
-    if (zigbee_connected) {
-        led_strip_set_pixel(led_strip, 0, 0, 48, 0); 
-    } else {
-        led_strip_clear(led_strip); 
+        if (zigbee_connected) {
+            led_strip_set_pixel(led_strip, 0, 0, 48, 0); 
+        } else {
+            led_strip_clear(led_strip); 
+        }
+        led_strip_refresh(led_strip);
     }
-    led_strip_refresh(led_strip);
+}
+
+// Visual indicator executed only once upon physical USB removal
+static void execute_power_loss_warning_sequence(void) {
+    ESP_LOGW(TAG, "VBUS disconnected! Executing alert before deep sleep...");
+    
+    // Kill the background pairing blinker immediately to prevent animation collisions
+    if (red_led_task_handle != NULL) {
+        vTaskDelete(red_led_task_handle);
+        red_led_task_handle = NULL;
+    }
+
+    // Flash Red exactly 5 times
+    for (int i = 0; i < 5; i++) {
+        led_strip_set_pixel(led_strip, 0, 64, 0, 0);
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        led_strip_clear(led_strip);
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// ---------- INSTANT POWER DROPDOWN MONITOR ----------
+static void power_monitor_task(void *pvParameters) {
+    while (1) {
+        // Rapidly poll the USB power status pin every 100ms
+        if (gpio_get_level(VBUS_DET_GPIO) == 0) {
+            
+            // If we were plugged in previously and just lost power, trigger the alert
+            if (total_boot_cycles == 0) {
+                execute_power_loss_warning_sequence();
+            }
+            
+            ESP_LOGI(TAG, "Entering Deep Sleep from Monitor Task.");
+            total_boot_cycles++;
+            
+            esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+            esp_deep_sleep_start();
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 // ---------- SENSOR LOGIC ----------
@@ -183,23 +254,29 @@ static void sensor_task(void *pvParameters) {
             continue;
         }
 
-        // Start conversion and wait for the hardware to finish sampling
         ds18b20_trigger_temperature_conversion(ds18b20_s1);
         vTaskDelay(pdMS_TO_TICKS(750)); 
 
         float temp1 = 0;
         if (ds18b20_get_temperature(ds18b20_s1, &temp1) == ESP_OK && temp1 > -100) {
-            
-            // Apply software calibration offset 
             float calibrated_temp1 = temp1 + SENSOR_OFFSET;
             sensor1_temp_value = (int16_t)(calibrated_temp1 * 100);
             
-            // Clean transmission loop: Unconditionally transmit every interval cycle
             report_temperature(SENSOR_1_ENDPOINT, sensor1_temp_value);
+            vTaskDelay(pdMS_TO_TICKS(500)); 
         }
 
-        // Wait exactly 5 minutes before repeating
-        vTaskDelay(pdMS_TO_TICKS(TRANSMIT_INTERVAL_MS));
+        // --- DUAL POWER BALANCING ARCHITECTURE ---
+        if (gpio_get_level(VBUS_DET_GPIO) == 0) {
+            // BATTERY MODE: Sleep pathway (Backup trigger if monitor task hasn't caught it yet)
+            total_boot_cycles++; 
+            esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+            esp_deep_sleep_start();
+        } else {
+            // USB MODE: Standard continuous delay loop
+            total_boot_cycles = 0; 
+            vTaskDelay(pdMS_TO_TICKS(TRANSMIT_INTERVAL_MS));
+        }
     }
 }
 
@@ -277,14 +354,22 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    init_power_detection();
     init_neopixel();
-    neopixel_startup_test_cycle();
-    
-    xTaskCreate(red_led_blink_task, "red_led_task", 2560, NULL, 2, &red_led_task_handle);
+
+    // Check actual power rails directly on bootup
+    if (gpio_get_level(VBUS_DET_GPIO) == 1) {
+        if (total_boot_cycles == 0) {
+            neopixel_startup_test_cycle();
+        }
+        xTaskCreate(red_led_blink_task, "red_led_task", 2560, NULL, 2, &red_led_task_handle);
+    }
 
     ds18b20_init_sensors();
     zigbee_init();
 
+    // Create the background rapid power monitoring task
+    xTaskCreate(power_monitor_task, "power_monitor_task", 3072, NULL, 6, &power_monitor_task_handle);
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
 
     esp_zb_start(false);
